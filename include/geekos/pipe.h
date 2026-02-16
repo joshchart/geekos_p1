@@ -12,6 +12,18 @@
  */
 #include <geekos/vfs.h>
 
+#define PIPE_BUFFER_SIZE (32 * 1024)
+
+struct Pipe {
+    char *buffer;
+    ulong_t capacity;
+    ulong_t readPos;
+    ulong_t writePos;
+    ulong_t count;
+    int readers;
+    int writers;
+};
+
 extern const struct File_Ops Pipe_Read_Ops;
 extern const struct File_Ops Pipe_Write_Ops;
 

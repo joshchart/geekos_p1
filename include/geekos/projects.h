@@ -67,8 +67,8 @@
 #define PROJECT_ARP false
 
 /* revised intro projects */
-#define PROJECT_PIPE false
-#define PROJECT_FORK false
+#define PROJECT_PIPE true
+#define PROJECT_FORK true
 
 #define PROJECT_SERIAL false
 #define PROJECT_MALLOC false

@@ -886,8 +886,50 @@ static int Sys_PlaySoundFile(struct Interrupt_State *state) {
  *   state->ecx - address of file descriptor for the write side
  */
 static int Sys_Pipe(struct Interrupt_State *state) {
-    TODO_P(PROJECT_PIPE, "Pipe system call");
-    return EUNSUPPORTED;
+    struct File *readFile = 0;
+    struct File *writeFile = 0;
+    int readFd = -1;
+    int writeFd = -1;
+    int rc;
+
+    DONE_P(PROJECT_PIPE, "Pipe system call");
+
+    rc = Pipe_Create(&readFile, &writeFile);
+    if(rc != 0)
+        return rc;
+
+    readFd = add_file_to_descriptor_table(readFile);
+    if(readFd < 0) {
+        rc = readFd;
+        goto fail;
+    }
+
+    writeFd = add_file_to_descriptor_table(writeFile);
+    if(writeFd < 0) {
+        rc = writeFd;
+        goto fail;
+    }
+
+    if(!Copy_To_User(state->ebx, &readFd, sizeof(int)) ||
+       !Copy_To_User(state->ecx, &writeFd, sizeof(int))) {
+        rc = EINVALID;
+        goto fail;
+    }
+
+    return 0;
+
+  fail:
+    if(readFd >= 0)
+        CURRENT_THREAD->userContext->file_descriptor_table[readFd] = 0;
+    if(writeFd >= 0)
+        CURRENT_THREAD->userContext->file_descriptor_table[writeFd] = 0;
+
+    if(readFile != 0)
+        Close(readFile);
+    if(writeFile != 0)
+        Close(writeFile);
+
+    return rc;
 }
 
 
