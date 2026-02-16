@@ -1,0 +1,21 @@
+.cache
+.venv
+.DS_Store
+*.swp
+compile_commands.json
+.claude/settings.local.json
+*.exe
+*.o
+*.bin
+build/geekos/
+build/libc/
+build/tools/
+build/.gdbinit
+build/*.img
+build/depend.mak
+
+# Learning hooks (instructor only)
+.env
+.claude/hooks/
+.claude/skill-invocations.log
+instructor/learning-hooks/__pycache__/

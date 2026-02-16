@@ -1,0 +1,11 @@
+# Submit server .submit file for
+#  Course CMSC412
+#  Project Project 1: Fork &amp; Exec
+
+courseName=CMSC412
+semester=202601
+projectNumber=Project 1
+courseKey=84a66a106c6483cb
+authentication.type=cas
+baseURL=https://submit.cs.umd.edu:443/spring2026
+submitURL=https://submit.cs.umd.edu:443/spring2026/eclipse/SubmitProjectViaEclipse
