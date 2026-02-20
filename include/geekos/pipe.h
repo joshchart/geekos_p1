@@ -11,6 +11,7 @@
  * enrolled in similar operating systems courses the University of Maryland's CMSC412 course.
  */
 #include <geekos/vfs.h>
+#include <geekos/synch.h>
 
 #define PIPE_BUFFER_SIZE (32 * 1024)
 
@@ -22,6 +23,9 @@ struct Pipe {
     ulong_t count;
     int readers;
     int writers;
+    struct Mutex     mutex;           /* protects all pipe state */
+    struct Condition dataAvailable;   /* readers wait here when buffer empty */
+    struct Condition spaceAvailable;  /* writers wait here when buffer full */
 };
 
 extern const struct File_Ops Pipe_Read_Ops;

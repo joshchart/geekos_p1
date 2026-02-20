@@ -56,6 +56,9 @@ int Pipe_Create(struct File **read_file, struct File **write_file) {
     pipe->count = 0;
     pipe->readers = 1;
     pipe->writers = 1;
+    Mutex_Init(&pipe->mutex);
+    Cond_Init(&pipe->dataAvailable);
+    Cond_Init(&pipe->spaceAvailable);
 
     readPipe = Allocate_File(&Pipe_Read_Ops, 0, 0, pipe, O_READ, 0);
     if(readPipe == 0) {
@@ -92,9 +95,14 @@ int Pipe_Read(struct File *f, void *buf, ulong_t numBytes) {
 
     pipe = (struct Pipe *)f->fsData;
 
-    if(pipe->count == 0) {
-        if(pipe->writers > 0)
-            return EWOULDBLOCK;
+    Mutex_Lock(&pipe->mutex);
+
+    /* Block while buffer is empty but writers still exist */
+    while (pipe->count == 0 && pipe->writers > 0)
+        Cond_Wait(&pipe->dataAvailable, &pipe->mutex);
+
+    if(pipe->count == 0) {      /* EOF: no data and no writers */
+        Mutex_Unlock(&pipe->mutex);
         return 0;
     }
 
@@ -106,6 +114,9 @@ int Pipe_Read(struct File *f, void *buf, ulong_t numBytes) {
 
     pipe->readPos = (pipe->readPos + bytesToRead) % pipe->capacity;
     pipe->count -= bytesToRead;
+
+    Cond_Signal(&pipe->spaceAvailable);
+    Mutex_Unlock(&pipe->mutex);
     return (int)bytesToRead;
 }
 
@@ -125,13 +136,23 @@ int Pipe_Write(struct File *f, void *buf, ulong_t numBytes) {
 
     pipe = (struct Pipe *)f->fsData;
 
-    if(pipe->readers == 0)
+    Mutex_Lock(&pipe->mutex);
+
+    if(pipe->readers == 0) {
+        Mutex_Unlock(&pipe->mutex);
         return EPIPE;
+    }
+
+    /* Block while buffer is full but readers still exist */
+    while (pipe->capacity - pipe->count == 0 && pipe->readers > 0)
+        Cond_Wait(&pipe->spaceAvailable, &pipe->mutex);
+
+    if(pipe->readers == 0) {
+        Mutex_Unlock(&pipe->mutex);
+        return EPIPE;
+    }
 
     freeBytes = pipe->capacity - pipe->count;
-    if(freeBytes == 0)
-        return 0;
-
     bytesToWrite = Min(numBytes, freeBytes);
     firstChunk = Min(bytesToWrite, pipe->capacity - pipe->writePos);
     memcpy(pipe->buffer + pipe->writePos, buf, firstChunk);
@@ -140,11 +161,15 @@ int Pipe_Write(struct File *f, void *buf, ulong_t numBytes) {
 
     pipe->writePos = (pipe->writePos + bytesToWrite) % pipe->capacity;
     pipe->count += bytesToWrite;
+
+    Cond_Signal(&pipe->dataAvailable);
+    Mutex_Unlock(&pipe->mutex);
     return (int)bytesToWrite;
 }
 
 int Pipe_Close(struct File *f) {
     struct Pipe *pipe;
+    bool should_free;
 
     DONE_P(PROJECT_PIPE, "Pipe close");
 
@@ -153,6 +178,8 @@ int Pipe_Close(struct File *f) {
 
     pipe = (struct Pipe *)f->fsData;
 
+    Mutex_Lock(&pipe->mutex);
+
     if(f->ops == &Pipe_Read_Ops) {
         KASSERT(pipe->readers > 0);
         --pipe->readers;
@@ -160,23 +187,21 @@ int Pipe_Close(struct File *f) {
         KASSERT(pipe->writers > 0);
         --pipe->writers;
     } else {
+        Mutex_Unlock(&pipe->mutex);
         return EINVALID;
     }
 
-    if(pipe->readers == 0 && pipe->writers > 0) {
-        if(pipe->buffer != 0) {
-            Free(pipe->buffer);
-            pipe->buffer = 0;
-        }
-        pipe->capacity = 0;
-        pipe->count = 0;
-        pipe->readPos = 0;
-        pipe->writePos = 0;
-    }
+    /* Wake any blocked threads so they can detect the endpoint closed */
+    Cond_Broadcast(&pipe->dataAvailable);
+    Cond_Broadcast(&pipe->spaceAvailable);
 
-    if(pipe->readers == 0 && pipe->writers == 0) {
-        if(pipe->buffer != 0)
-            Free(pipe->buffer);
+    /* Capture inside lock: only the thread that makes both 0 will free */
+    should_free = (pipe->readers == 0 && pipe->writers == 0);
+
+    Mutex_Unlock(&pipe->mutex);
+
+    if(should_free) {
+        Free(pipe->buffer);
         Free(pipe);
     }
 

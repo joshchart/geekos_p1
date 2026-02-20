@@ -33,6 +33,10 @@
 #include <geekos/pipe.h>
 #include <geekos/mem.h>
 #include <geekos/smp.h>
+#include <geekos/atomic.h>
+
+/* Defined in userseg.c; no separate header */
+extern struct User_Context *Create_User_Context(ulong_t size);
 
 extern Spin_Lock_t kthreadLock;
 extern Spin_Lock_t printLock;  /* From screen.c - console output synchronization */
@@ -77,6 +81,20 @@ extern int Copy_User_String(ulong_t uaddr, ulong_t len, ulong_t maxLen,
 }
 
 /*
+ * Close all open file descriptors in a user context.
+ * Called from Sys_Exit and Sys_Execl before tearing down the context.
+ */
+static void Close_All_FDs(struct User_Context *ctx) {
+    int i;
+    for(i = 0; i < USER_MAX_FILES; i++) {
+        if(ctx->file_descriptor_table[i] != 0) {
+            Close(ctx->file_descriptor_table[i]);
+            ctx->file_descriptor_table[i] = 0;
+        }
+    }
+}
+
+/*
  * Null system call.
  * Does nothing except immediately return control back
  * to the interrupted user program.
@@ -100,6 +118,10 @@ static int Sys_Null(struct Interrupt_State *state
  *   Never returns to user mode!
  */
 static int Sys_Exit(struct Interrupt_State *state) {
+    /* Close all file descriptors before exiting to avoid lock-ordering issues
+     * (Pipe_Close acquires pipe->mutex; Destroy_Thread holds kthreadLock). */
+    if(CURRENT_THREAD->userContext != 0)
+        Close_All_FDs(CURRENT_THREAD->userContext);
     Exit(state->ebx);
     /* We will never get here. */
 }
@@ -935,11 +957,49 @@ static int Sys_Pipe(struct Interrupt_State *state) {
 
 
 static int Sys_Fork(struct Interrupt_State *state) {
-    TODO_P(PROJECT_FORK, "Fork system call");
-    return EUNSUPPORTED;
+    int i;
+    struct User_Context *parentCtx = CURRENT_THREAD->userContext;
+    struct User_Context *childCtx;
+    struct Kernel_Thread *childThread;
+
+    DONE_P(PROJECT_FORK, "Fork system call");
+
+    /* 1. Allocate a new User_Context and copy all of parent's memory */
+    childCtx = Create_User_Context(parentCtx->size);
+    if(childCtx == 0)
+        return ENOMEM;
+    memcpy(childCtx->memory, parentCtx->memory, parentCtx->size);
+    strncpy(childCtx->name, parentCtx->name, MAX_PROC_NAME_SZB);
+    childCtx->name[MAX_PROC_NAME_SZB - 1] = '\0';
+
+    /* Re-initialize LDT descriptors to point at the child's memory block
+     * (Create_User_Context already did this for the fresh block, so the
+     * selectors are already correct; we just need to preserve entry/arg addrs) */
+    childCtx->entryAddr      = parentCtx->entryAddr;
+    childCtx->argBlockAddr   = parentCtx->argBlockAddr;
+    childCtx->stackPointerAddr = parentCtx->stackPointerAddr;
+
+    /* 2. Copy file descriptor table; bump refCount for each inherited file */
+    for(i = 0; i < USER_MAX_FILES; i++) {
+        struct File *f = parentCtx->file_descriptor_table[i];
+        childCtx->file_descriptor_table[i] = f;
+        if(f != 0)
+            Atomic_Increment(&f->refCount);
+    }
+
+    /* 3. Create child kernel thread; it will return 0 from fork() */
+    childThread = Fork_User_Thread(childCtx, state);
+    if(childThread == 0) {
+        /* Undo the refCount bumps and free the child context */
+        Close_All_FDs(childCtx);
+        Destroy_User_Context(childCtx);
+        return ENOMEM;
+    }
+
+    return childThread->pid;   /* parent gets child's pid */
 }
 
-/* 
+/*
  * Exec a new program in this process.
  * Params:
  *   state->ebx - user address of name of executable
@@ -949,8 +1009,73 @@ static int Sys_Fork(struct Interrupt_State *state) {
  * Returns: doesn't if successful, error code (< 0) otherwise
  */
 static int Sys_Execl(struct Interrupt_State *state) {
-    TODO_P(PROJECT_FORK, "Execl system call");
-    return EUNSUPPORTED;
+    int rc, i;
+    char *program = 0, *command = 0;
+    void *exeFileData = 0;
+    ulong_t exeFileLength;
+    struct User_Context *newCtx = 0;
+    struct Exe_Format exeFormat;
+
+    DONE_P(PROJECT_FORK, "Execl system call");
+
+    /* 1. Copy program name and command string from user space */
+    if((rc = Copy_User_String(state->ebx, state->ecx,
+                              VFS_MAX_PATH_LEN, &program)) != 0 ||
+       (rc = Copy_User_String(state->edx, state->esi, 1023, &command)) != 0)
+        goto fail;
+
+    /* 2. Load the new executable */
+    if((rc = Read_Fully(program, &exeFileData, &exeFileLength)) != 0 ||
+       (rc = Parse_ELF_Executable(exeFileData, exeFileLength, &exeFormat)) != 0 ||
+       (rc = Load_User_Program(exeFileData, exeFileLength,
+                               &exeFormat, command, &newCtx)) != 0)
+        goto fail;
+
+    Free(exeFileData); exeFileData = 0;
+
+    /* 3. Inherit file descriptors: copy table and bump refCounts */
+    {
+        struct User_Context *oldCtx = CURRENT_THREAD->userContext;
+        for(i = 0; i < USER_MAX_FILES; i++) {
+            struct File *f = oldCtx->file_descriptor_table[i];
+            newCtx->file_descriptor_table[i] = f;
+            if(f != 0)
+                Atomic_Increment(&f->refCount);
+        }
+        strncpy(newCtx->name, program, MAX_PROC_NAME_SZB);
+        newCtx->name[MAX_PROC_NAME_SZB - 1] = '\0';
+
+        /* 4. Close old context's files (safe here — no locks held) */
+        Close_All_FDs(oldCtx);
+
+        /* 5. Swap user contexts */
+        Detach_User_Context(CURRENT_THREAD);
+        Attach_User_Context(CURRENT_THREAD, newCtx);
+    }
+
+    /* 6. Rewrite interrupt state so iret jumps to the new program */
+    {
+        struct User_Interrupt_State *us = (struct User_Interrupt_State *)state;
+        state->eip    = newCtx->entryAddr;
+        state->cs     = newCtx->csSelector;
+        state->eflags = EFLAGS_IF;
+        state->gs = state->fs = state->es = state->ds = newCtx->dsSelector;
+        state->esi    = newCtx->argBlockAddr;
+        state->eax = state->ebx = state->ecx =
+        state->edx = state->edi = state->ebp = 0;
+        us->espUser = newCtx->stackPointerAddr;
+        us->ssUser  = newCtx->dsSelector;
+    }
+
+    Free(program); Free(command);
+    return 0;
+
+fail:
+    if(exeFileData) Free(exeFileData);
+    if(newCtx)      Destroy_User_Context(newCtx);
+    if(program)     Free(program);
+    if(command)     Free(command);
+    return rc;
 }
 
 /* 

@@ -23,6 +23,7 @@
 #include <geekos/synch.h>
 #include <geekos/vfs.h>
 #include <geekos/projects.h>
+#include <geekos/atomic.h>
 
 /*
  * Notes:
@@ -424,13 +425,15 @@ int Open(const char *path, int mode, struct File **pFile) {
  * Returns: 0 if successful, error code (< 0) if not
  */
 int Close(struct File *file) {
-    
+    int rc;
 
     KASSERT(file->ops->Close != 0);     /* All filesystems must implement Close(). */
 
-    TODO_P(PROJECT_FORK, "Manage reference count");
+    DONE_P(PROJECT_FORK, "Manage reference count");
 
-    int rc; /* rc stands for return code; common idiom/name */
+    if (Atomic_Decrement(&file->refCount) > 0)
+        return 0;           /* other references remain; do nothing */
+
     rc = file->ops->Close(file);
     if(rc == 0)
         Free(file);
@@ -512,6 +515,7 @@ struct File *Allocate_File(const struct File_Ops *ops, int filePos,
         file->fsData = fsData;
         file->mode = mode;
         file->mountPoint = mountPoint;
+        file->refCount = 1;
     }
     return file;
 }

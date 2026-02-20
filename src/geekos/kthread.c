@@ -623,6 +623,32 @@ struct Kernel_Thread *Start_Kernel_Thread(Thread_Start_Func startFunc,
 }
 
 /*
+ * Fork a user-mode thread, copying the parent's interrupt state so
+ * that the child resumes at the same PC but with eax=0 (fork returns 0 in child).
+ * Returns pointer to the new thread if successful, null otherwise.
+ */
+struct Kernel_Thread *Fork_User_Thread(struct User_Context *childContext,
+                                       struct Interrupt_State *parentState) {
+    struct Kernel_Thread *child = Create_Thread(PRIORITY_USER, false);
+    if(child == 0)
+        return 0;
+
+    Attach_User_Context(child, childContext);
+
+    /* Place a copy of the parent's User_Interrupt_State on the child's fresh
+     * kernel stack.  Switch_To_Thread restores via iret, so it needs exactly
+     * this layout at child->esp. */
+    child->esp -= sizeof(struct User_Interrupt_State);
+    struct User_Interrupt_State *cs =
+        (struct User_Interrupt_State *)child->esp;
+    *cs = *((struct User_Interrupt_State *)parentState);
+    cs->state.eax = 0;          /* fork() returns 0 in the child */
+
+    Make_Runnable_Atomic(child);
+    return child;
+}
+
+/*
  * Start a user-mode thread (i.e., a process), using given user context.
  * Returns pointer to the new thread if successful, null otherwise.
  */
